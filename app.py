@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import zipfile
 import threading
 import requests
 import numpy as np
@@ -11,16 +12,18 @@ from datetime import datetime
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import uvicorn
+from huggingface_hub import HfApi, create_repo
 
 # ==============================================================================
-# 🍏 24/7 WEBULL NASDAQ AAPL 267-COLUMN 50-LEVEL QUANT RECORDER & CLUSTER
-# Full 50-Level Order Book + 1M-15M Multi-Scale Matrix + Intrabar Order Flow
+# 🍏 24/7 WEBULL NASDAQ AAPL 267-COLUMN QUANT RECORDER + HUGGING FACE AUTO-VAULT
 # ==============================================================================
 
 app = FastAPI(title="NASDAQ Apple 267-Column 50-Level Quant Collector")
 
 ACCESS_TOKEN = os.getenv("WEBULL_ACCESS_TOKEN", "dc_us_tech1.1a03a513524-f2e7777af5e240e5a062ea36c4ba4b05")
 DID = os.getenv("WEBULL_DID", "e4ji2amvxlo3hh491wi0twpal3t5qauo")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+HF_REPO = os.getenv("HF_REPO", "gavali77/aapl-50level-quant-vault")
 TICKER_ID = "913256135" # Apple Inc. (AAPL)
 DATA_DIR = "collected_data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -40,14 +43,13 @@ HEADERS = {
     "locale": "eng"
 }
 
-# 267-Column Master Schema Definition
+# Build 267-Column Schema
 fields = [
     ("timestamp_ms", pa.int64()),
     ("datetime_str", pa.string()),
     ("symbol", pa.string()),
     ("candle_progress_sec_15m", pa.int64()),
 
-    # 1. Multi-Scale Matrix (1M, 2M, 3M, 4M, 5M, 10M, 15M) = 35 Columns
     ("open_1m", pa.float64()), ("high_1m", pa.float64()), ("low_1m", pa.float64()), ("close_1m", pa.float64()), ("vol_1m", pa.float64()),
     ("open_2m", pa.float64()), ("high_2m", pa.float64()), ("low_2m", pa.float64()), ("close_2m", pa.float64()), ("vol_2m", pa.float64()),
     ("open_3m", pa.float64()), ("high_3m", pa.float64()), ("low_3m", pa.float64()), ("close_3m", pa.float64()), ("vol_3m", pa.float64()),
@@ -56,14 +58,12 @@ fields = [
     ("open_10m", pa.float64()), ("high_10m", pa.float64()), ("low_10m", pa.float64()), ("close_10m", pa.float64()), ("vol_10m", pa.float64()),
     ("open_15m", pa.float64()), ("high_15m", pa.float64()), ("low_15m", pa.float64()), ("close_15m", pa.float64()), ("vol_15m", pa.float64()),
 
-    # 2. Intrabar Dynamics = 5 Columns
     ("high_first_flag", pa.int64()),
     ("high_low_time_delta_sec", pa.float64()),
     ("time_spent_upper_half_pct", pa.float64()),
     ("terminal_tick_velocity_10s", pa.float64()),
     ("terminal_volume_10s", pa.float64()),
 
-    # 3. Order Flow Delta & Microstructure = 12 Columns
     ("buy_volume", pa.float64()),
     ("sell_volume", pa.float64()),
     ("volume_delta", pa.float64()),
@@ -77,7 +77,6 @@ fields = [
     ("trades_count", pa.int64()),
     ("avg_trade_size", pa.float64()),
 
-    # 4. Slopes & Imbalances = 11 Columns
     ("depth_imb_l1", pa.float64()),
     ("depth_imb_l5", pa.float64()),
     ("depth_imb_l10", pa.float64()),
@@ -91,7 +90,6 @@ fields = [
     ("spread", pa.float64()),
 ]
 
-# 5. Full 50-Level Order Book (200 Columns)
 for i in range(1, 51):
     fields.extend([
         (f"bid_p{i}", pa.float64()), (f"bid_q{i}", pa.float64()),
@@ -103,10 +101,10 @@ SCHEMA_267 = pa.schema(fields)
 live_state = {
     "status": "RUNNING 🟢",
     "token_health": "100% HEALTHY ✅",
+    "hf_sync_status": "READY ☁️" if HF_TOKEN else "SET HF_TOKEN IN ENV",
     "last_update": "N/A",
     "price": 0.0,
     "volume_delta": 0.0,
-    "net_inst_flow": 0.0,
     "sentiment": "N/A",
     "total_snapshots": 0,
     "columns_count": len(SCHEMA_267),
@@ -114,12 +112,32 @@ live_state = {
     "current_token": ACCESS_TOKEN[:15] + "..." + ACCESS_TOKEN[-10:]
 }
 
-# Rolling history for calculating 1M to 15M candles in memory
 ticks_history = []
 
 def get_today_parquet_path():
     today_str = datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(DATA_DIR, f"webull_aapl_{today_str}_267col.parquet")
+    return os.path.join(DATA_DIR, f"webull_aapl_{today_str}.parquet")
+
+def sync_to_huggingface(file_path):
+    """Automatically uploads parquet files to Hugging Face Dataset repo."""
+    if not HF_TOKEN:
+        return
+    try:
+        api = HfApi(token=HF_TOKEN)
+        create_repo(repo_id=HF_REPO, repo_type="dataset", token=HF_TOKEN, private=True, exist_ok=True)
+        fname = os.path.basename(file_path)
+        api.upload_file(
+            path_or_fileobj=file_path,
+            path_in_repo=f"daily_vault/{fname}",
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+        live_state["hf_sync_status"] = f"SYNCED ({datetime.now().strftime('%H:%M:%S')}) 🟢"
+        print(f"☁️ [HUGGING FACE SYNC] Successfully uploaded {fname} to {HF_REPO}!", flush=True)
+    except Exception as e:
+        live_state["hf_sync_status"] = f"SYNC NOTE: {str(e)[:30]}"
+        print(f"⚠️ Hugging Face Sync: {e}", flush=True)
 
 def verify_token():
     url_test = f"https://quotes-gw.webullfintech.com/api/bgw/quote/realtime?ids={TICKER_ID}&includeSecu=1&delay=0&more=1"
@@ -155,16 +173,12 @@ def fetch_quant_snapshot_267():
         price = float(quote.get("close", 0.0))
         vol = float(quote.get("volume", 0.0))
 
-        item = r_flow.get("latest", {}).get("item", {})
-        net_inst_flow = float(item.get("largeNetFlow", 0.0))
-
         buy_vol = float(r_stat.get("buyVolume", 0.0))
         sell_vol = float(r_stat.get("sellVolume", 0.0))
         vol_delta = buy_vol - sell_vol
 
-        # Store in rolling tick buffer
         ticks_history.append({"t": ts_ms, "p": price, "v": vol})
-        if len(ticks_history) > 950: # Keep 15 mins of seconds buffer
+        if len(ticks_history) > 950:
             ticks_history.pop(0)
 
         def get_rolling_candle(seconds_window):
@@ -201,7 +215,6 @@ def fetch_quant_snapshot_267():
         spoofed_sell = round(sell_vol * 0.10, 2) if vol_delta > 0 else 0.0
         levels_swept = int(range_1m / 0.01) if (range_1m / 0.01) >= 2 else 0
 
-        # Build Full 50-Level Order Book Matrix
         spread_tick = 0.01
         best_bid = c1 - (spread_tick / 2.0)
         best_ask = c1 + (spread_tick / 2.0)
@@ -314,6 +327,7 @@ def background_recorder_loop():
     print(f"🚀 24/7 267-Column 50-Level Background Recorder Running...", flush=True)
     batch = []
     last_health_check_hour = -1
+    sync_counter = 0
 
     while True:
         try:
@@ -334,6 +348,7 @@ def background_recorder_loop():
                 target_file = get_today_parquet_path()
                 live_state["current_file"] = os.path.basename(target_file)
 
+                # 1 Single Consolidated File Per Day
                 if len(batch) >= 10:
                     df = pd.DataFrame(batch)
                     table = pa.Table.from_pandas(df, schema=SCHEMA_267)
@@ -342,10 +357,15 @@ def background_recorder_loop():
                     else:
                         existing = pq.read_table(target_file)
                         pq.write_table(pa.concat_tables([existing, table]), target_file)
-                    print(f"💾 Synced {len(batch)} 267-Col records to {target_file}", flush=True)
                     batch = []
+                    sync_counter += 1
+
+                    if sync_counter >= 30: # Auto-sync to Hugging Face every ~5 mins
+                        sync_to_huggingface(target_file)
+                        sync_counter = 0
+
         except Exception as e:
-            print(f"⚠️ Background Loop Note: {e}", flush=True)
+            pass
         time.sleep(1)
 
 threading.Thread(target=background_recorder_loop, daemon=True).start()
@@ -365,20 +385,22 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🍏 NASDAQ Apple 267-Column 50-Level Live Quant Recorder</title>
+        <title>🍏 NASDAQ Apple 267-Col 50-Level Quant Engine</title>
         <meta http-equiv="refresh" content="2">
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0e14; color: #fff; text-align: center; padding: 40px; }}
             .card {{ background: #151922; border: 1px solid #232936; border-radius: 16px; padding: 25px; max-width: 650px; margin: 0 auto; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }}
             h1 {{ color: #00e676; font-size: 24px; margin-bottom: 5px; }}
             .stat {{ font-size: 32px; font-weight: bold; margin: 15px 0; color: #fff; }}
-            .badge {{ display: inline-block; padding: 6px 16px; border-radius: 20px; background: #1e2430; font-size: 14px; margin-bottom: 20px; border: 1px solid #323c4e; }}
-            .token-badge {{ display: inline-block; padding: 6px 16px; border-radius: 12px; background: {badge_bg}; font-size: 13px; color: {badge_color}; margin-bottom: 15px; border: 1px solid {badge_color}; font-weight: bold; }}
+            .badge {{ display: inline-block; padding: 6px 16px; border-radius: 20px; background: #1e2430; font-size: 14px; margin-bottom: 10px; border: 1px solid #323c4e; }}
+            .token-badge {{ display: inline-block; padding: 4px 14px; border-radius: 12px; background: {badge_bg}; font-size: 12px; color: {badge_color}; margin-bottom: 10px; border: 1px solid {badge_color}; font-weight: bold; }}
+            .hf-badge {{ display: inline-block; padding: 4px 14px; border-radius: 12px; background: #1c2738; font-size: 12px; color: #58a6ff; margin-bottom: 15px; border: 1px solid #58a6ff; }}
             .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; text-align: left; margin: 20px 0; }}
             .box {{ background: #1a202c; padding: 15px; border-radius: 10px; }}
             .label {{ color: #8b949e; font-size: 12px; }}
             .val {{ font-size: 18px; font-weight: bold; margin-top: 5px; }}
             .files {{ text-align: left; margin-top: 25px; background: #1a202c; padding: 15px; border-radius: 10px; }}
+            .btn-zip {{ display: inline-block; background: #ff9800; color: #000; padding: 8px 16px; border-radius: 8px; font-weight: bold; text-decoration: none; margin-top: 10px; }}
             .update-box {{ text-align: left; margin-top: 20px; background: #1a202c; padding: 15px; border-radius: 10px; }}
             input[type=text] {{ width: 75%; padding: 8px; border-radius: 6px; border: 1px solid #323c4e; background: #0b0e14; color: #fff; }}
             button {{ padding: 8px 16px; border-radius: 6px; border: none; background: #00e676; color: #000; font-weight: bold; cursor: pointer; }}
@@ -389,7 +411,8 @@ def dashboard():
     <body>
         <div class="card">
             <h1>🍏 AAPL 267-Col 50-Level Quant Engine</h1>
-            <div class="token-badge">Token Status: {live_state["token_health"]}</div><br>
+            <div class="token-badge">Webull: {live_state["token_health"]}</div>
+            <div class="hf-badge">Hugging Face Vault: {live_state["hf_sync_status"]}</div><br>
             <div class="badge">Engine Status: {live_state["status"]} | Schema: {live_state["columns_count"]} Columns</div>
             
             <div class="stat">${live_state["price"]:.2f}</div>
@@ -413,18 +436,19 @@ def dashboard():
                 </div>
             </div>
 
+            <div class="files">
+                <div class="label" style="font-weight:bold; margin-bottom: 8px; color: #fff;">💾 Download Daily Parquet Files (1 File / Day):</div>
+                <ul>{files_html}</ul>
+                <a href="/download-zip" class="btn-zip">📦 Download ALL Days (ZIP)</a>
+                <a href="https://huggingface.co/datasets/gavali77/aapl-50level-quant-vault" target="_blank" style="display:inline-block; margin-left: 10px; color:#58a6ff; text-decoration:none; font-size:12px;">☁️ Open HuggingFace Vault ↗</a>
+            </div>
+
             <div class="update-box">
                 <div class="label" style="font-weight:bold; margin-bottom: 8px; color: #fff;">🔑 1-Click Token Update:</div>
                 <form action="/update-token" method="post">
                     <input type="text" name="new_token" placeholder="Paste new access_token here..." required>
                     <button type="submit">Update</button>
                 </form>
-                <div class="label" style="margin-top:5px;">Active Token: {live_state["current_token"]}</div>
-            </div>
-
-            <div class="files">
-                <div class="label" style="font-weight:bold; margin-bottom: 8px; color: #fff;">💾 Download 267-Column Parquet Datasets:</div>
-                <ul>{files_html}</ul>
             </div>
             
             <p style="color: #6e7681; font-size: 11px; margin-top: 15px;">Last Update: {live_state["last_update"]}</p>
@@ -434,13 +458,20 @@ def dashboard():
     """
     return html
 
+@app.get("/download-zip")
+def download_zip():
+    zip_path = "aapl_vault_all_days.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for f in os.listdir(DATA_DIR):
+            if f.endswith(".parquet"):
+                zipf.write(os.path.join(DATA_DIR, f), arcname=f)
+    return FileResponse(zip_path, media_type="application/zip", filename=zip_path)
+
 @app.post("/update-token")
 def update_token(new_token: str = Form(...)):
     global HEADERS
     HEADERS["access_token"] = new_token.strip()
-    live_state["current_token"] = new_token[:15] + "..." + new_token[-10:]
     verify_token()
-    print(f"🔄 Token Updated via Web Dashboard! Health: {live_state['token_health']}", flush=True)
     return RedirectResponse(url="/", status_code=303)
 
 @app.get("/download/{filename}")
