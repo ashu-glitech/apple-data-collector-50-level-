@@ -8,14 +8,15 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import uvicorn
 from huggingface_hub import HfApi, create_repo
 
 # ==============================================================================
-# 🍏 24/7 WEBULL NASDAQ AAPL 267-COLUMN QUANT RECORDER + HUGGING FACE AUTO-VAULT
+# 🍏 24/7 NASDAQ AAPL 267-COL QUANT RECORDER WITH SMART MARKET-HOURS FILTER
+# Only records when market is actively ticking. Pauses during closed market.
 # ==============================================================================
 
 app = FastAPI(title="NASDAQ Apple 267-Column 50-Level Quant Collector")
@@ -43,7 +44,6 @@ HEADERS = {
     "locale": "eng"
 }
 
-# Build 267-Column Schema
 fields = [
     ("timestamp_ms", pa.int64()),
     ("datetime_str", pa.string()),
@@ -99,11 +99,13 @@ for i in range(1, 51):
 SCHEMA_267 = pa.schema(fields)
 
 live_state = {
-    "status": "RUNNING 🟢",
+    "status": "ACTIVE 🟢",
+    "market_status": "OPEN",
     "token_health": "100% HEALTHY ✅",
     "hf_sync_status": "READY ☁️" if HF_TOKEN else "SET HF_TOKEN IN ENV",
     "last_update": "N/A",
     "price": 0.0,
+    "volume": 0.0,
     "volume_delta": 0.0,
     "sentiment": "N/A",
     "total_snapshots": 0,
@@ -113,13 +115,14 @@ live_state = {
 }
 
 ticks_history = []
+last_recorded_volume = -1
+last_recorded_price = -1
 
 def get_today_parquet_path():
     today_str = datetime.now().strftime("%Y-%m-%d")
     return os.path.join(DATA_DIR, f"webull_aapl_{today_str}.parquet")
 
 def sync_to_huggingface(file_path):
-    """Automatically uploads parquet files to Hugging Face Dataset repo."""
     if not HF_TOKEN:
         return
     try:
@@ -134,7 +137,7 @@ def sync_to_huggingface(file_path):
             token=HF_TOKEN
         )
         live_state["hf_sync_status"] = f"SYNCED ({datetime.now().strftime('%H:%M:%S')}) 🟢"
-        print(f"☁️ [HUGGING FACE SYNC] Successfully uploaded {fname} to {HF_REPO}!", flush=True)
+        print(f"☁️ [HUGGING FACE SYNC] Uploaded {fname} to {HF_REPO}!", flush=True)
     except Exception as e:
         live_state["hf_sync_status"] = f"SYNC NOTE: {str(e)[:30]}"
         print(f"⚠️ Hugging Face Sync: {e}", flush=True)
@@ -154,6 +157,7 @@ def verify_token():
         return False
 
 def fetch_quant_snapshot_267():
+    global last_recorded_volume, last_recorded_price
     try:
         url_quote = f"https://quotes-gw.webullfintech.com/api/bgw/quote/realtime?ids={TICKER_ID}&includeSecu=1&delay=0&more=1"
         res_quote = requests.get(url_quote, headers=HEADERS, timeout=5).json()
@@ -172,6 +176,18 @@ def fetch_quant_snapshot_267():
 
         price = float(quote.get("close", 0.0))
         vol = float(quote.get("volume", 0.0))
+
+        # Check if new tick/volume has occurred
+        trade_status = quote.get("tradeStatus", "T")
+        is_market_active = True
+        if vol == last_recorded_volume and price == last_recorded_price and last_recorded_volume > 0:
+            # Volume and Price have not moved -> Market is closed / static
+            live_state["market_status"] = "MARKET CLOSED / PAUSED 🌙"
+            is_market_active = False
+        else:
+            live_state["market_status"] = "MARKET ACTIVE & TICKING 🟢"
+            last_recorded_volume = vol
+            last_recorded_price = price
 
         buy_vol = float(r_stat.get("buyVolume", 0.0))
         sell_vol = float(r_stat.get("sellVolume", 0.0))
@@ -317,10 +333,10 @@ def fetch_quant_snapshot_267():
             "spread": spread_tick
         }
         row.update(depth_dict)
-        return row
+        return row, is_market_active
     except Exception as e:
         print(f"⚠️ Fetch Error: {e}", flush=True)
-        return None
+        return None, False
 
 def background_recorder_loop():
     verify_token()
@@ -336,19 +352,22 @@ def background_recorder_loop():
                 verify_token()
                 last_health_check_hour = now.hour
 
-            snap = fetch_quant_snapshot_267()
-            if snap:
-                batch.append(snap)
+            snap_result = fetch_quant_snapshot_267()
+            if snap_result and snap_result[0]:
+                snap, is_active = snap_result
                 live_state["last_update"] = snap["datetime_str"]
                 live_state["price"] = snap["close_1m"]
                 live_state["volume_delta"] = snap["volume_delta"]
                 live_state["sentiment"] = "BULLISH 🟢" if snap["volume_delta"] > 0 else "BEARISH 🔴"
-                live_state["total_snapshots"] += 1
                 
                 target_file = get_today_parquet_path()
                 live_state["current_file"] = os.path.basename(target_file)
 
-                # 1 Single Consolidated File Per Day
+                # ONLY write to parquet if market has active ticks/volume
+                if is_active:
+                    batch.append(snap)
+                    live_state["total_snapshots"] += 1
+
                 if len(batch) >= 10:
                     df = pd.DataFrame(batch)
                     table = pa.Table.from_pandas(df, schema=SCHEMA_267)
@@ -360,7 +379,7 @@ def background_recorder_loop():
                     batch = []
                     sync_counter += 1
 
-                    if sync_counter >= 30: # Auto-sync to Hugging Face every ~5 mins
+                    if sync_counter >= 30:
                         sync_to_huggingface(target_file)
                         sync_counter = 0
 
@@ -413,7 +432,7 @@ def dashboard():
             <h1>🍏 AAPL 267-Col 50-Level Quant Engine</h1>
             <div class="token-badge">Webull: {live_state["token_health"]}</div>
             <div class="hf-badge">Hugging Face Vault: {live_state["hf_sync_status"]}</div><br>
-            <div class="badge">Engine Status: {live_state["status"]} | Schema: {live_state["columns_count"]} Columns</div>
+            <div class="badge">Market State: {live_state["market_status"]}</div>
             
             <div class="stat">${live_state["price"]:.2f}</div>
             
@@ -432,7 +451,7 @@ def dashboard():
                 </div>
                 <div class="box">
                     <div class="label">Total Recorded</div>
-                    <div class="val">{live_state["total_snapshots"]:,} Snapshots</div>
+                    <div class="val">{live_state["total_snapshots"]:,} Active Snapshots</div>
                 </div>
             </div>
 
