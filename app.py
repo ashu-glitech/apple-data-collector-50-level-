@@ -389,7 +389,11 @@ def background_recorder_loop():
 
 threading.Thread(target=background_recorder_loop, daemon=True).start()
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/health", methods=["GET", "HEAD"])
+def health_check():
+    return {"status": "ok"}
+
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def dashboard():
     delta_k = live_state["volume_delta"] / 1e3
     
