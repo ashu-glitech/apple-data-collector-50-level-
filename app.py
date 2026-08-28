@@ -177,15 +177,26 @@ def fetch_quant_snapshot_267():
         price = float(quote.get("close", 0.0))
         vol = float(quote.get("volume", 0.0))
 
-        # Check if new tick/volume has occurred
-        trade_status = quote.get("tradeStatus", "T")
-        is_market_active = True
-        if vol == last_recorded_volume and price == last_recorded_price and last_recorded_volume > 0:
-            # Volume and Price have not moved -> Market is closed / static
+        # Strict Regular Market Hours Check (09:30 AM to 04:00 PM New York Time, Monday to Friday)
+        try:
+            from zoneinfo import ZoneInfo
+            ny_now = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            ny_now = datetime.now()
+
+        is_weekday = ny_now.weekday() < 5
+        ny_min = ny_now.hour * 60 + ny_now.minute
+        is_reg_market = is_weekday and (9 * 60 + 30 <= ny_min < 16 * 60)
+
+        # Check if new tick/volume has occurred within regular market hours
+        is_market_active = False
+        if not is_reg_market:
             live_state["market_status"] = "MARKET CLOSED / PAUSED 🌙"
-            is_market_active = False
+        elif vol == last_recorded_volume and price == last_recorded_price and last_recorded_volume > 0:
+            live_state["market_status"] = "MARKET PAUSED (NO TICKS) ⏸️"
         else:
             live_state["market_status"] = "MARKET ACTIVE & TICKING 🟢"
+            is_market_active = True
             last_recorded_volume = vol
             last_recorded_price = price
 
