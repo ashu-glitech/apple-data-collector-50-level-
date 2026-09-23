@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import uvicorn
-from huggingface_hub import HfApi, create_repo
+from huggingface_hub import HfApi, create_repo, hf_hub_download
+import shutil
 
 # ==============================================================================
 # 🍏 24/7 NASDAQ AAPL 267-COL QUANT RECORDER WITH SMART MARKET-HOURS FILTER
@@ -349,7 +350,27 @@ def fetch_quant_snapshot_267():
         print(f"⚠️ Fetch Error: {e}", flush=True)
         return None, False
 
+def resume_daily_file_from_hf():
+    filename = get_today_parquet_path()
+    fname = os.path.basename(filename)
+    if not os.path.exists(filename) and HF_TOKEN and HF_REPO:
+        try:
+            print(f"🔄 Checking if {fname} exists on HF to resume...", flush=True)
+            file_path = hf_hub_download(
+                repo_id=HF_REPO,
+                filename=f"daily_vault/{fname}",
+                repo_type="dataset",
+                token=HF_TOKEN
+            )
+            shutil.copy(file_path, filename)
+            global current_active_filename
+            current_active_filename = filename
+            print(f"✅ Successfully resumed {fname} from HF!", flush=True)
+        except Exception as e:
+            print(f"ℹ️ No existing file on HF for today or error fetching: {e}. Starting fresh.", flush=True)
+
 def background_recorder_loop():
+    resume_daily_file_from_hf()
     verify_token()
     print(f"🚀 24/7 267-Column 50-Level Background Recorder Running...", flush=True)
     batch = []
@@ -373,6 +394,16 @@ def background_recorder_loop():
                 
                 target_file = get_today_parquet_path()
                 live_state["current_file"] = os.path.basename(target_file)
+                
+                # --- DAY ROLLOVER PROTECTION ---
+                global current_active_filename
+                if 'current_active_filename' not in globals():
+                    current_active_filename = target_file
+                    
+                if current_active_filename != target_file:
+                    threading.Thread(target=sync_to_huggingface, args=(current_active_filename,), daemon=True).start()
+                    current_active_filename = target_file
+                # -------------------------------
 
                 # ONLY write to parquet if market has active ticks/volume
                 if is_active:
