@@ -390,7 +390,7 @@ def background_recorder_loop():
                     batch = []
                     sync_counter += 1
 
-                    if sync_counter >= 30:
+                    if sync_counter >= 1800:
                         sync_to_huggingface(target_file)
                         sync_counter = 0
 
